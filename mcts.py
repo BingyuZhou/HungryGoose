@@ -7,7 +7,6 @@ from kaggle_environments.envs.hungry_geese.hungry_geese import (
 )
 from kaggle_environments import evaluate, make, utils, Environment
 import numpy as np
-from numpy.core.fromnumeric import size
 
 
 Actions = [Action.SOUTH, Action.WEST, Action.NORTH, Action.EAST]
@@ -16,6 +15,17 @@ ActionOp = [1, 0, -1, 0, 1]
 N = 11
 M = 7
 num_opponent_action_space = 3
+
+
+def oppositeAction(action_name: str) -> str:
+    if action_name == Action.SOUTH.name:
+        return Action.NORTH.name
+    if action_name == Action.NORTH.name:
+        return Action.SOUTH.name
+    if action_name == Action.EAST.name:
+        return Action.WEST.name
+    if action_name == Action.WEST.name:
+        return Action.EAST.name
 
 
 class QNode:
@@ -27,11 +37,14 @@ class QNode:
 
 
 def getActionCandidates(
-    geese: List[List[int]], last_actions: List[Action]
-) -> List[List[Action]]:
+    geese: List[List[int]], last_actions: List[str]
+) -> List[List[str]]:
     """Get action candidates for all geese"""
     feasible_actions = []
     for goose, last_action in zip(geese, last_actions):
+        if len(goose) == 0:
+            feasible_actions.append([])
+            continue
         head_x, head_y = row_col(goose[0], N)
         actions = []
         for i in range(4):
@@ -47,11 +60,11 @@ def getActionCandidates(
             if (
                 len(goose) <= 2
                 and last_action
-                and Actions[i].name == last_action.opposite().name
+                and Actions[i].name == oppositeAction(last_action)
             ):
                 continue
 
-            actions.append(Actions[i])
+            actions.append(Actions[i].name)
         feasible_actions.append(actions)
 
     return feasible_actions
@@ -70,10 +83,12 @@ class Node:
 
         self.is_dead = self._isDead()
 
-    def _isDead(self,) -> bool:
+    def _isDead(
+        self,
+    ) -> bool:
         return self.env.done or self.env.state[self.player_ind]["status"] == "INACTIVE"
 
-    def getActionCandidates(self,) -> List[List[Action]]:
+    def getActionCandidates(self) -> List[List[str]]:
         """Get action candidates for all geese"""
         geese = self.env.state[self.player_ind].observation.geese
         return getActionCandidates(geese, self.last_actions)
@@ -92,20 +107,24 @@ def sampleOpponentActions(actions: List[List[Action]], player_ind: int) -> List[
     else:
         result_set = set()
         while len(result_set) < num_opponent_action_space:
-            a = np.random.choice(actions[0])
-            b = np.random.choice(actions[1])
-            c = np.random.choice(actions[2])
-            result_set.add((a, b, c))
+            sample = []
+            for i, acts in enumerate(actions):
+                if i == player_ind:
+                    continue
+                sample.append(np.random.choice(acts))
+            result_set.add(tuple(sample))
         return [list(r) for r in result_set]
 
 
 class MCTS:
     def __init__(self, state, steps, player_ind) -> None:
-        root_env = make("Hungry_geese", state=state, steps=steps, debug=True)
-        self.root = Node(root_env)
+        """Monte Carlo Tree Search"""
+        root_env = make("hungry_geese", state=state, steps=steps, debug=True)
+        last_actions = [agent.action for agent in state]
+        self.root = Node(root_env, player_ind, last_actions)
         self.player_ind = player_ind
 
-    def select(self):
+    def select(self) -> List[Node]:
         """Select a path from root"""
         tmp = self.root
         path = [self.root]
@@ -114,8 +133,9 @@ class MCTS:
             path.append(tmp)
         return path
 
-    def expansion(self, node: Node):
+    def expansion(self, path: List[Node]) -> List[Node]:
         """Expand node for feasible moves"""
+        node = path[-1]
         if node.is_dead:
             return
 
@@ -127,16 +147,19 @@ class MCTS:
             opponent_actions = sampleOpponentActions(actions, self.player_ind)
             for oppoent_act in opponent_actions:
                 oppoent_act.insert(self.player_ind, act)
-                child = Node(node.env, self.player_ind, act)
+                child = Node(node.env.clone(), self.player_ind, oppoent_act)
                 child.env.step(oppoent_act)
                 Qchild.next.append(child)
 
         sample_qnode = np.random.choice(node.next)
-        return np.random.choice(sample_qnode.next)
+        sample_node = np.random.choice(sample_qnode.next)
+        path.append(sample_qnode)
+        path.append(sample_node)
+        return path
 
-    def sim(self, node: Node, steps: int):
+    def sim(self, node: Node, steps: int) -> bool:
         sim_env = node.env.clone()
-        last_actions = node.last_actions.copy()
+        last_actions = node.last_actions
         for _ in range(steps):
             geese = sim_env.state[self.player_ind].observation.geese
             actions_candidates = getActionCandidates(geese, last_actions)
@@ -146,10 +169,13 @@ class MCTS:
             ]
             last_actions = actions
             sim_env.step(actions)
-            if sim_env.done:
+            if sim_env.done or sim_env.state[self.player_ind].status == "DONE":
                 break
         rewards = [state.reward for state in sim_env.state]
         return rewards.index(max(rewards)) == self.player_ind
 
-    def backprop(self):
-        pass
+    def backprop(self, path: List[Node], result: bool) -> None:
+        for node in path:
+            if result:
+                node.wins += 1
+            node.sims += 1
